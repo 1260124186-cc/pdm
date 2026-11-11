@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pdm import termui
-from pdm.cli.commands.venv.utils import get_venv_parent, get_venv_prefix
+from pdm.cli.commands.venv.utils import get_venv_parent, get_venv_prefix, write_venv_owner
 from pdm.exceptions import PdmUsageError, ProjectError
 
 if TYPE_CHECKING:
@@ -131,6 +131,10 @@ class Backend(abc.ABC):
             )
         self._ensure_clean(location, force)
         self.perform_create(location, args, prompt=prompt)
+        if not in_project:
+            # Record the owning project inside central venvs so that
+            # `pdm venv purge` can prove ownership before removing anything.
+            write_venv_owner(location, self.project)
         return location
 
     @abc.abstractmethod

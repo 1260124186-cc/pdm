@@ -1,3 +1,4 @@
+import json
 import os
 import platform
 import re
@@ -11,7 +12,18 @@ import pytest
 import shellingham
 
 from pdm.cli.commands.venv import backends
-from pdm.cli.commands.venv.utils import get_venv_prefix
+from pdm.cli.commands.venv.utils import (
+    ACTIVE,
+    MANUAL,
+    ORPHANED,
+    UNCONFIRMED,
+    VENV_OWNER_FILE,
+    classify_central_venv,
+    get_venv_parent,
+    get_venv_prefix,
+    reconcile_central_venvs,
+)
+from pdm.models.venv import get_venv_python
 
 
 @pytest.fixture(params=[True, False])
@@ -30,6 +42,28 @@ def fake_create(monkeypatch):
     monkeypatch.setattr(backends.VirtualenvBackend, "perform_create", fake_create)
     monkeypatch.setattr(backends.VenvBackend, "perform_create", fake_create)
     monkeypatch.setattr(backends.CondaBackend, "perform_create", fake_create)
+
+
+def make_central_venv(venv_parent: Path, name: str, owner: Path | str | None, *, corrupt: bool = False) -> Path:
+    """Create a minimal venv-like entry under the central ``venv.location``.
+
+    ``owner=None`` writes no ownership marker (manual/legacy entry); pass
+    ``corrupt=True`` to write an unreadable marker.
+    """
+    path = venv_parent / name
+    python = get_venv_python(path)
+    python.parent.mkdir(parents=True)
+    python.touch()
+    if owner is not None:
+        payload = {
+            "schema": 1,
+            "project": str(owner),
+            "created_at": "2026-01-01T00:00:00+00:00",
+        }
+        (path / VENV_OWNER_FILE).write_text(json.dumps(payload), encoding="utf-8")
+    elif corrupt:
+        (path / VENV_OWNER_FILE).write_text("{not valid json", encoding="utf-8")
+    return path
 
 
 def test_core_registration_does_not_import_runtime_helpers():
@@ -321,49 +355,173 @@ def test_venv_auto_create(pdm, mocker, project, keep_pypackages):
 
 
 @pytest.mark.usefixtures("fake_create")
-def test_venv_purge(pdm, project):
+def test_venv_purge_empty(pdm, project):
     project.project_config["venv.in_project"] = False
     result = pdm(["venv", "purge"], obj=project)
     assert result.exit_code == 0, result.stderr
-
-    result = pdm(["venv", "create"], obj=project)
-    assert result.exit_code == 0, result.stderr
-    venv_path = re.match(r"Virtualenv (.+) is created successfully", result.output).group(1)
-    result = pdm(["venv", "purge"], input="y", obj=project)
-    assert result.exit_code == 0, result.stderr
-    assert not os.path.exists(venv_path)
+    assert "No virtualenvs to purge" in result.output
 
 
 @pytest.mark.usefixtures("fake_create")
-def test_venv_purge_force(pdm, project):
+def test_central_venv_creation_writes_owner_marker(pdm, project):
     project.project_config["venv.in_project"] = False
-    result = pdm(["venv", "create"], obj=project)
-    assert result.exit_code == 0, result.stderr
-    venv_path = re.match(r"Virtualenv (.+) is created successfully", result.output).group(1)
-    result = pdm(["venv", "purge", "-f"], obj=project)
-    assert result.exit_code == 0, result.stderr
-    assert not os.path.exists(venv_path)
+    result = pdm(["venv", "create"], obj=project, strict=True)
+    venv_path = Path(re.match(r"Virtualenv (.+) is created successfully", result.output).group(1))
+    marker = venv_path / VENV_OWNER_FILE
+    assert marker.is_file()
+    assert json.loads(marker.read_text())["project"] == project.root.as_posix()
 
 
-user_options = [("none", True), ("0", False), ("all", False)]
+@pytest.mark.usefixtures("fake_create")
+def test_in_project_venv_creation_skips_owner_marker(pdm, project):
+    project.project_config["venv.in_project"] = True
+    pdm(["venv", "create"], obj=project, strict=True)
+    assert not (project.root / ".venv" / VENV_OWNER_FILE).exists()
 
 
-@pytest.mark.usefixtures("venv_backends")
-@pytest.mark.parametrize("user_choices, is_path_exists", user_options)
-def test_venv_purge_interactive(pdm, user_choices, is_path_exists, project):
+def test_classify_central_venv_statuses(project, tmp_path):
+    venv_parent = get_venv_parent(project)
+    venv_parent.mkdir(parents=True)
+    live_owner = tmp_path / "live-project"
+    live_owner.mkdir()
+    gone_owner = tmp_path / "gone-project"
+
+    active = make_central_venv(venv_parent, "live-project-HASH1234-3.12", live_owner)
+    orphan = make_central_venv(venv_parent, "gone-project-HASH5678-3.11", gone_owner)
+    legacy = make_central_venv(venv_parent, "oldproject-Ab_CD123-3.10", None)
+    manual = make_central_venv(venv_parent, "my-manual-env", None)
+    corrupt = make_central_venv(venv_parent, "broken-project-HASH9012-3.9", None, corrupt=True)
+    linked = venv_parent / "linked-env"
+    linked.symlink_to(active, target_is_directory=True)
+
+    assert classify_central_venv(active).status == ACTIVE
+    assert classify_central_venv(orphan).status == ORPHANED
+    assert classify_central_venv(legacy).status == UNCONFIRMED
+    assert classify_central_venv(manual).status == MANUAL
+    assert classify_central_venv(corrupt).status == UNCONFIRMED
+    assert classify_central_venv(linked).status == MANUAL
+
+    records = {record.name: record for record in reconcile_central_venvs(project)}
+    assert set(records) == {active.name, orphan.name, legacy.name, manual.name, corrupt.name, linked.name}
+    assert records[orphan.name].owner == gone_owner
+    # Reconciliation order is deterministic, so interrupted runs converge.
+    assert [record.name for record in reconcile_central_venvs(project)] == sorted(records)
+
+
+@pytest.mark.usefixtures("fake_create")
+def test_venv_purge_keeps_active_unconfirmed_and_manual(pdm, project, tmp_path):
     project.project_config["venv.in_project"] = False
-    result = pdm(["venv", "create"], obj=project)
+    result = pdm(["venv", "create"], obj=project, strict=True)
+    live_venv = Path(re.match(r"Virtualenv (.+) is created successfully", result.output).group(1))
+
+    venv_parent = get_venv_parent(project)
+    orphan = make_central_venv(venv_parent, "gone-project-HASH5678-3.11", tmp_path / "gone-project")
+    legacy = make_central_venv(venv_parent, "oldproject-Ab_CD123-3.10", None)
+    manual = make_central_venv(venv_parent, "my-manual-env", None)
+
+    result = pdm(["venv", "purge", "-f"], obj=project, strict=True)
+    assert not orphan.exists(), "confirmed orphan must be purged"
+    assert live_venv.exists(), "active venv of an existing project must be kept"
+    assert legacy.exists(), "unconfirmed legacy PDM venv must be kept"
+    assert manual.exists(), "manually created directory must be kept"
+    assert "Orphaned virtualenvs" in result.output
+    assert "Active virtualenvs" in result.output
+
+    # Re-running after the first purge is a no-op and yields the same tree.
+    remaining_before = sorted(p.name for p in venv_parent.iterdir())
+    result = pdm(["venv", "purge", "-f"], obj=project, strict=True)
+    assert "No orphaned virtualenvs found" in result.output
+    assert sorted(p.name for p in venv_parent.iterdir()) == remaining_before
+
+
+@pytest.mark.usefixtures("fake_create")
+def test_venv_purge_is_idempotent_after_interruption(pdm, project, tmp_path):
+    venv_parent = get_venv_parent(project)
+    orphans = [
+        make_central_venv(venv_parent, f"gone-project-HASH000{i}-3.11", tmp_path / f"gone-{i}") for i in range(3)
+    ]
+    pdm(["venv", "purge", "-f"], obj=project, strict=True)
+    assert all(not path.exists() for path in orphans)
+
+    # A second run must not error nor touch anything else.
+    result = pdm(["venv", "purge", "-f"], obj=project, strict=True)
+    assert result.exit_code == 0
+    assert all(not path.exists() for path in orphans)
+
+
+@pytest.mark.usefixtures("fake_create")
+@pytest.mark.parametrize("confirmed, removed", [(True, True), (False, False)])
+def test_venv_purge_asks_for_confirmation(pdm, mocker, project, tmp_path, confirmed, removed):
+    venv_parent = get_venv_parent(project)
+    orphan = make_central_venv(venv_parent, "gone-project-HASH5678-3.11", tmp_path / "gone-project")
+    mock_confirm = mocker.patch("pdm.termui.confirm", return_value=confirmed)
+    result = pdm(["venv", "purge"], obj=project)
     assert result.exit_code == 0, result.stderr
-    venv_path = re.match(r"Virtualenv (.+) is created successfully", result.output).group(1)
-    result = pdm(["venv", "purge", "-i"], input=user_choices, obj=project)
+    mock_confirm.assert_called_once()
+    assert orphan.exists() != removed
+
+
+@pytest.mark.usefixtures("fake_create")
+def test_venv_purge_clears_saved_python_of_removed_venv(pdm, project, tmp_path):
+    venv_parent = get_venv_parent(project)
+    orphan = make_central_venv(venv_parent, "gone-project-HASH5678-3.11", tmp_path / "gone-project")
+    project._saved_python = get_venv_python(orphan).as_posix()
+
+    pdm(["venv", "purge", "-f"], obj=project, strict=True)
+    assert not orphan.exists()
+    assert project._saved_python is None, "stale .pdm-python record must not outlive the venv"
+
+
+@pytest.mark.usefixtures("fake_create")
+def test_venv_purge_keeps_saved_python_of_kept_venv(pdm, project):
+    project.project_config["venv.in_project"] = False
+    result = pdm(["venv", "create"], obj=project, strict=True)
+    live_venv = Path(re.match(r"Virtualenv (.+) is created successfully", result.output).group(1))
+    saved = get_venv_python(live_venv).as_posix()
+    project._saved_python = saved
+
+    pdm(["venv", "purge", "-f"], obj=project, strict=True)
+    assert live_venv.exists()
+    assert project._saved_python == saved
+
+
+interactive_choices = [("none", False), ("0", True), ("all", True)]
+
+
+@pytest.mark.usefixtures("fake_create")
+@pytest.mark.parametrize("choice, removed", interactive_choices)
+def test_venv_purge_interactive(pdm, choice, removed, project, tmp_path):
+    venv_parent = get_venv_parent(project)
+    orphan = make_central_venv(venv_parent, "gone-project-HASH5678-3.11", tmp_path / "gone-project")
+    result = pdm(["venv", "purge", "-i"], input=choice, obj=project)
     assert result.exit_code == 0, result.stderr
-    assert os.path.exists(venv_path) == is_path_exists
+    assert orphan.exists() != removed
+
+
+@pytest.mark.usefixtures("fake_create")
+def test_venv_purge_all_restores_blanket_behavior(pdm, project, tmp_path):
+    project.project_config["venv.in_project"] = False
+    result = pdm(["venv", "create"], obj=project, strict=True)
+    live_venv = Path(re.match(r"Virtualenv (.+) is created successfully", result.output).group(1))
+    venv_parent = get_venv_parent(project)
+    manual = make_central_venv(venv_parent, "my-manual-env", None)
+    linked = venv_parent / "linked-env"
+    linked.symlink_to(live_venv, target_is_directory=True)
+
+    pdm(["venv", "purge", "--all", "-f"], obj=project, strict=True)
+    assert not live_venv.exists()
+    assert not manual.exists()
+    assert not linked.is_symlink()
 
 
 def test_virtualenv_backend_create(project, mocker, with_pip):
     backend = backends.VirtualenvBackend(project, None)
     assert backend.ident
-    mock_call = mocker.patch("subprocess.check_call")
+
+    def create_location(cmd, **kwargs):
+        Path(cmd[3]).mkdir(parents=True)
+
+    mock_call = mocker.patch("subprocess.check_call", side_effect=create_location)
     location = backend.create(with_pip=with_pip)
     pip_args = [] if with_pip else ["--no-pip", "--no-setuptools", "--no-wheel"]
     mock_call.assert_called_once_with(
@@ -378,12 +536,19 @@ def test_virtualenv_backend_create(project, mocker, with_pip):
         ],
         stdout=ANY,
     )
+    marker = location / VENV_OWNER_FILE
+    assert marker.is_file()
+    assert json.loads(marker.read_text())["project"] == project.root.as_posix()
 
 
 def test_venv_backend_create(project, mocker, with_pip):
     backend = backends.VenvBackend(project, None)
     assert backend.ident
-    mock_call = mocker.patch("subprocess.check_call")
+
+    def create_location(cmd, **kwargs):
+        Path(cmd[3]).mkdir(parents=True)
+
+    mock_call = mocker.patch("subprocess.check_call", side_effect=create_location)
     location = backend.create(with_pip=with_pip)
     pip_args = [] if with_pip else ["--without-pip"]
     mock_call.assert_called_once_with(
@@ -396,13 +561,20 @@ def test_venv_backend_create(project, mocker, with_pip):
         ],
         stdout=ANY,
     )
+    marker = location / VENV_OWNER_FILE
+    assert marker.is_file()
+    assert json.loads(marker.read_text())["project"] == project.root.as_posix()
 
 
 def test_conda_backend_create(project, mocker, with_pip):
     assert project.python
+
+    def create_prefix(cmd, **kwargs):
+        Path(cmd[cmd.index("--prefix") + 1]).mkdir(parents=True)
+
     backend = backends.CondaBackend(project, "3.9")
     assert backend.ident == "3.9"
-    mock_call = mocker.patch("subprocess.check_call")
+    mock_call = mocker.patch("subprocess.check_call", side_effect=create_prefix)
     location = backend.create(with_pip=with_pip)
     pip_args = ["pip"] if with_pip else []
     mock_call.assert_called_once_with(
@@ -417,6 +589,9 @@ def test_conda_backend_create(project, mocker, with_pip):
         ],
         stdout=ANY,
     )
+    marker = location / VENV_OWNER_FILE
+    assert marker.is_file()
+    assert json.loads(marker.read_text())["project"] == project.root.as_posix()
 
     backend = backends.CondaBackend(project, None)
     python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
@@ -433,3 +608,4 @@ def test_conda_backend_create(project, mocker, with_pip):
         ],
         stdout=ANY,
     )
+    assert (location / VENV_OWNER_FILE).is_file()

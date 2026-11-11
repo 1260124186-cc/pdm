@@ -87,6 +87,45 @@ Will remove: C:\Users\Frost Ming\AppData\Local\pdm\pdm\venvs\test-project-8Sgn_6
 Removed C:\Users\Frost Ming\AppData\Local\pdm\pdm\venvs\test-project-8Sgn_62n-for-test
 ```
 
+## Purge orphaned virtualenvs
+
+Every centrally created virtualenv carries an ownership marker (`.pdm-venv.json`)
+recording the project root it was created for. `pdm venv purge` reconciles all
+entries under `venv.location` against those markers before deleting anything:
+
+- **Orphaned** — the marker is readable but its owner project no longer exists
+  (the project was deleted or moved): these are the only entries removed.
+- **Active** — the owner project still exists: kept.
+- **Unconfirmed** — PDM-style venv with a missing or unreadable marker, or an
+  owner path that is not a directory: kept, because ownership cannot be proven.
+- **Manual** — directories without any PDM ownership marker (including manually
+  created environments, files and symlinks): kept.
+
+An audit listing every entry and its status is printed before the confirmation
+prompt. The scan is read-only and deleting a venv removes its marker in the same
+operation, so an interrupted purge can simply be re-run: it converges to the same
+result without duplicate effects. If the current project's `.pdm-python` points
+into a removed venv, that stale interpreter record is cleared as well so the
+project cannot keep reusing a deleted environment.
+
+```bash
+# Show the audit and remove confirmed orphans after confirmation
+pdm venv purge
+# Same, without prompting
+pdm venv purge --force
+# Pick the orphaned venvs interactively
+pdm venv purge --interactive
+```
+
+Virtualenvs created by older PDM versions predate ownership markers and are
+therefore always treated as unconfirmed and retained. If you really want to wipe
+*every* entry under `venv.location`, including manual and unconfirmed ones, use
+the explicit opt-in:
+
+```bash
+pdm venv purge --all --force
+```
+
 ## Activate a virtualenv
 
 Instead of spawning a subshell like what `pipenv` and `poetry` do, `pdm venv` doesn't create the shell for you but print the activate command to the console. In this way you won't leave the current shell. You can then feed the output to `eval` to activate the virtualenv:
