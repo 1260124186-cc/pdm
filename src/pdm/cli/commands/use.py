@@ -87,8 +87,11 @@ class Command(BaseCommand):
             cached_python = PythonInfo.from_path(path)
             if not cached_python.valid:
                 project.core.ui.error(
-                    f"The last selection is corrupted. {path!r}",
+                    f"The last selection is corrupted. {path!r} Forgetting it and searching for another interpreter."
                 )
+                # Converge the stale remembered selection so the broken path is
+                # not reused on the next invocation either.
+                use_cache.delete(python)
             elif version_matcher(cached_python):
                 project.core.ui.info("Using the last selection, add '-i' to ignore it.")
                 return cached_python
@@ -113,7 +116,11 @@ class Command(BaseCommand):
         )
         if not found_interpreters:
             req = python if ignore_requires_python else f'requires-python="{project.python_requires}"'
-            raise NoPythonVersion(f"No Python interpreter matching [success]{req}[/] is found.")
+            raise NoPythonVersion(
+                f"No Python interpreter matching [success]{req}[/] is found. Install a compatible one with "
+                "[success]`pdm python install <version>`[/] or pass an explicit path to [success]`pdm use`[/]. "
+                "The project binding is left untouched until a matching interpreter is selected."
+            )
 
         if first or len(found_interpreters) == 1 or not termui.is_interactive():
             project.core.ui.info("Using the first matched interpreter.")

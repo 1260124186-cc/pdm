@@ -71,6 +71,29 @@ def test_use_remember_last_selection(project, mocker):
     project.find_interpreters.assert_not_called()
 
 
+def test_use_forgets_corrupted_remembered_selection(project, mocker):
+    """A remembered selection whose interpreter no longer exists is pruned
+    from use_cache.json and replaced by a freshly selected valid interpreter."""
+    from pdm.models.python import PythonInfo
+
+    stale_path = (project.root / "removed-env" / "bin" / "python").as_posix()
+    cache = JSONFileCache(project.cache_dir / "use_cache.json")
+    cache.set("3", stale_path)
+
+    host_python = PythonInfo.from_path(sys.executable)
+    mocker.patch.object(project, "find_interpreters", side_effect=lambda *args, **kwargs: iter([host_python]))
+    # The interpreter running the tests may live inside a venv/conda prefix;
+    # isolate this test from that environment detail.
+    mocker.patch.object(PythonInfo, "get_venv", return_value=None)
+
+    selected = UseCommand().do_use(project, "3", first=True)
+
+    assert selected.executable == host_python.executable
+    cache._read_cache()
+    assert cache.get("3") == host_python.path.as_posix()
+    assert stale_path not in cache._cache.values()
+
+
 def test_use_venv_python(project, pdm):
     pdm(["venv", "create"], obj=project, strict=True)
     pdm(["venv", "create", "--name", "test"], obj=project, strict=True)

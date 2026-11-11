@@ -435,6 +435,111 @@ def test_set_non_exist_python_path(project_no_init):
     assert project_no_init.python.executable.name != "non-exist-python"
 
 
+def test_stale_saved_python_converges_all_records(project, mocker):
+    """A broken saved interpreter converges .pdm-python, use_cache.json and
+    an unsatisfiable .python-version pin, then rebinds to a valid interpreter."""
+    from pdm.models.caches import JSONFileCache
+    from pdm.models.python import PythonInfo
+
+    stale_path = (project.root / "removed-env" / "bin" / "python").as_posix()
+    project._saved_python = stale_path
+    project._python = None
+    project.root.joinpath(".python-version").write_text("3.9\n")
+
+    use_cache = JSONFileCache(project.cache_dir / "use_cache.json")
+    use_cache.set("3.9", stale_path)
+    use_cache.set("manual", sys.executable)
+
+    host_python = PythonInfo.from_path(sys.executable)
+
+    def fake_find_interpreters(spec=None, search_venv=None):
+        if spec == "3.9":
+            return iter(())
+        return iter([host_python])
+
+    mocker.patch.object(project, "find_interpreters", side_effect=fake_find_interpreters)
+
+    selected = project.resolve_interpreter()
+
+    assert selected.executable == host_python.executable
+    # The project record is rebound to the working interpreter, no broken path left.
+    assert project._saved_python == host_python.path.as_posix()
+    # The unsatisfiable version pin is converged.
+    assert not project.root.joinpath(".python-version").exists()
+    # Stale cache entry is pruned while the valid manual selection is preserved.
+    use_cache._read_cache()
+    assert "3.9" not in use_cache._cache
+    assert use_cache.get("manual") == sys.executable
+
+
+def test_iter_interpreters_falls_back_when_version_pin_unsatisfiable(project, mocker):
+    """A .python-version pin without a valid interpreter must not force an
+    install of that version; resolution retries without the pin."""
+    from pdm.models.python import PythonInfo
+
+    project._saved_python = None
+    project.root.joinpath(".python-version").write_text("3.9\n")
+    host_python = PythonInfo.from_path(sys.executable)
+    seen_specs: list[str | None] = []
+
+    def fake_find_interpreters(spec=None, search_venv=None):
+        seen_specs.append(spec)
+        if spec == "3.9":
+            return iter(())
+        return iter([host_python])
+
+    mocker.patch.object(project, "find_interpreters", side_effect=fake_find_interpreters)
+
+    found = list(project.iter_interpreters())
+
+    assert found == [host_python]
+    # The pin is honoured first, then retried unconstrained instead of installing 3.9.
+    assert seen_specs == ["3.9", None]
+
+
+def test_resolve_interpreter_keeps_retryable_state_when_no_match(project, mocker):
+    """When nothing satisfies requires-python, raise a clear error without
+    binding the project to a wrong version, leaving the state retryable."""
+    from pdm.exceptions import NoPythonVersion
+
+    project.pyproject.metadata["requires-python"] = ">=3.99"
+    stale_path = (project.root / "removed-env" / "bin" / "python").as_posix()
+    project._saved_python = stale_path
+    project._python = None
+    mocker.patch.object(project, "find_interpreters", return_value=iter(()))
+    mocker.patch.object(project, "get_best_matching_cpython_version", return_value=None)
+
+    with pytest.raises(NoPythonVersion):
+        project.resolve_interpreter()
+
+    assert not project.root.joinpath(".pdm-python").exists()
+    assert project._python is None
+
+
+def test_mismatched_but_valid_saved_python_only_clears_pointer(project, mocker):
+    """A valid interpreter that no longer matches requires-python only drops
+    the project pointer; other records and the interpreter itself stay intact."""
+    from pdm.exceptions import NoPythonVersion
+    from pdm.models.caches import JSONFileCache
+
+    project.pyproject.metadata["requires-python"] = ">=3.99"
+    project._saved_python = sys.executable
+    project._python = None
+    project.root.joinpath(".python-version").write_text("3.14\n")
+    use_cache = JSONFileCache(project.cache_dir / "use_cache.json")
+    use_cache.set("manual", sys.executable)
+    mocker.patch.object(project, "find_interpreters", return_value=iter(()))
+    mocker.patch.object(project, "get_best_matching_cpython_version", return_value=None)
+
+    with pytest.raises(NoPythonVersion):
+        project.resolve_interpreter()
+
+    assert not project.root.joinpath(".pdm-python").exists()
+    assert project.root.joinpath(".python-version").read_text().strip() == "3.14"
+    use_cache._read_cache()
+    assert use_cache.get("manual") == sys.executable
+
+
 @pytest.mark.usefixtures("venv_backends")
 def test_create_venv_first_time(pdm, project, local_finder):
     project.project_config.update({"venv.in_project": False})

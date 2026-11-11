@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import stat
-from collections.abc import Iterable
+from collections.abc import ItemsView, Iterable
 from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Generic, TypeVar
@@ -66,6 +66,16 @@ class JSONFileCache(Generic[KT, VT]):
         key = self._get_key(obj)
         self._cache[key] = value
         self._write_cache()
+
+    def delete(self, obj: KT) -> None:
+        """Remove a cached entry. No error is raised if the key does not exist."""
+        key = self._get_key(obj)
+        if self._cache.pop(key, None) is not None:
+            self._write_cache()
+
+    def items(self) -> ItemsView[str, VT]:
+        """Return the cached key-value pairs."""
+        return self._cache.items()
 
 
 class CandidateInfoCache(JSONFileCache[Candidate, CandidateInfo]):

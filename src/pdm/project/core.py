@@ -319,8 +319,64 @@ class Project:
         with open_for_write_no_symlink(python_file) as fp:
             fp.write(value)
 
+    def _read_python_version_pin(self) -> str | None:
+        """Read the version pinned by the project's ``.python-version`` file.
+
+        Only a file containing a single non-comment line is considered a pin,
+        matching the semantics used when resolving interpreters.
+        """
+        version_file = self.root.joinpath(".python-version")
+        if not version_file.exists():
+            return None
+        content = version_file.read_text().strip()
+        content_lines = [line for line in content.splitlines() if not line.lstrip().startswith("#")]
+        return content_lines[0] if len(content_lines) == 1 else None
+
+    def _discard_stale_python_binding(self, stale_path: str) -> None:
+        """Converge every local record pointing at a broken interpreter.
+
+        Only PDM-managed records are touched, real interpreters and manually
+        created virtual environments are never removed:
+
+        * the project's ``.pdm-python`` pointer;
+        * ``use_cache.json`` entries whose target interpreter no longer works;
+        * a ``.python-version`` pin whose version has no valid interpreter.
+        """
+        from pdm.models.caches import JSONFileCache
+
+        # 1. Drop the project pointer. When PDM_PYTHON is set it still takes
+        #    precedence on the next run, but resolution keeps working anyway.
+        self._saved_python = None
+
+        # 2. Prune remembered selections targeting invalid interpreters.
+        #    Entries pointing at still-valid interpreters are preserved: they
+        #    may belong to manually linked environments or other projects.
+        cache_file = self.cache_dir / "use_cache.json"
+        if cache_file.exists():
+            use_cache: JSONFileCache[str, str] = JSONFileCache(cache_file)
+            for key, path in list(use_cache.items()):
+                if not PythonInfo.from_path(path).valid:
+                    use_cache.delete(key)
+
+        # 3. A .python-version pin that cannot be satisfied would keep forcing
+        #    the removed version (and trigger an install attempt), remove it so
+        #    another compatible interpreter can be selected. It is rewritten
+        #    automatically by `pdm use` once a new interpreter is chosen.
+        if self.config["python.use_python_version"]:
+            pin = self._read_python_version_pin()
+            if (
+                pin is not None
+                and pin in self.python_requires
+                and not any(interpreter.valid for interpreter in self.find_interpreters(pin))
+            ):
+                version_file = self.root.joinpath(".python-version")
+                with contextlib.suppress(OSError):
+                    version_file.unlink()
+                self.core.ui.info(f"Removed the stale .python-version pin {pin!r}, no valid interpreter matches it.")
+
     def resolve_interpreter(self) -> PythonInfo:
         """Get the Python interpreter path."""
+        from pdm.cli.commands.venv.backends import VirtualenvCreateError
         from pdm.cli.commands.venv.utils import iter_venvs
         from pdm.models.venv import get_venv_python
 
@@ -343,12 +399,18 @@ class Project:
             if match_version(python):
                 return python
             elif not python.valid:
-                note("The saved Python interpreter does not exist or broken. Trying to find another one.")
+                note(
+                    f"The saved Python interpreter {saved_path!r} does not exist or is broken. "
+                    "Cleaning up the stale binding and looking for another one..."
+                )
+                # Converge .pdm-python, use_cache.json and a stale .python-version
+                self._discard_stale_python_binding(saved_path)
             else:
                 note(
                     "The saved Python interpreter doesn't match the project's requirement. Trying to find another one."
                 )
-            self._saved_python = None  # Clear the saved path if it doesn't match
+                # The interpreter itself still works, only drop the project pointer.
+                self._saved_python = None
 
         if config.get("python.use_venv") and not self.is_global:
             # Resolve virtual environments from env-vars
@@ -377,7 +439,16 @@ class Project:
                     f"The virtualenv is being created for you as it cannot be matched to the right version."
                 )
                 note("python.use_venv is on, creating a virtualenv for this project...")
-                venv_path = self._create_virtualenv()
+                try:
+                    venv_path = self._create_virtualenv()
+                except VirtualenvCreateError as e:
+                    raise NoPythonVersion(
+                        f"Unable to create a virtualenv: {e}. No Python interpreter satisfying "
+                        f"[success]{self.python_requires}[/] is available. Install one with "
+                        "[success]`pdm python install <version>`[/] or select an existing one with "
+                        "[success]`pdm use -f <python>`[/]. The stale binding has been cleared, "
+                        "so retrying after installing a compatible interpreter is safe."
+                    ) from e
                 self.python = PythonInfo.from_path(get_venv_python(venv_path))
                 return self.python
 
@@ -389,7 +460,12 @@ class Project:
                 self.python = py_version
                 return py_version
 
-        raise NoPythonVersion(f"No Python that satisfies {self.python_requires} is found on the system.")
+        raise NoPythonVersion(
+            f"No Python that satisfies [success]{self.python_requires}[/] is found on the system. "
+            "Install a compatible interpreter with [success]`pdm python install <version>`[/] or select one "
+            "manually with [success]`pdm use -f <python>`[/]. The stale binding has been cleared, "
+            "so the project is not pointed at any broken interpreter and retrying is safe."
+        )
 
     def get_environment(self) -> BaseEnvironment:
         from pdm.environments import PythonEnvironment, PythonLocalEnvironment
@@ -968,24 +1044,34 @@ class Project:
 
         from pdm.cli.commands.python import InstallCommand
 
-        def read_version_from_version_file(python_version_file: Path) -> str | None:
-            content = python_version_file.read_text().strip()
-            content_lines = [cl for cl in content.splitlines() if not cl.lstrip().startswith("#")]
-
-            return content_lines[0] if len(content_lines) == 1 else None
-
         version_file = self.root.joinpath(".python-version")
         found = False
+        pinned_spec = False
         if respect_version_file and not python_spec and (os.getenv("PDM_PYTHON_VERSION") or version_file.exists()):
-            requested = os.getenv("PDM_PYTHON_VERSION") or read_version_from_version_file(version_file)
+            requested = os.getenv("PDM_PYTHON_VERSION") or self._read_python_version_pin()
             if requested is not None and requested not in self.python_requires:
                 self.core.ui.warn(".python-version is found but the version is not in requires-python, ignored.")
             elif requested is not None:
                 python_spec = requested
+                pinned_spec = True
         for interpreter in self.find_interpreters(python_spec, search_venv):
             if filter_func is None or filter_func(interpreter):
                 found = True
                 yield interpreter
+        if not found and pinned_spec:
+            # The pinned version is no longer available (e.g. its environment
+            # was removed). Do not force an install of the stale pin: retry
+            # without it so any other interpreter satisfying requires-python
+            # can be selected.
+            self.core.ui.warn(
+                f"No valid interpreter matching the .python-version pin {python_spec!r} is found, "
+                "ignoring the pin and looking for another compatible interpreter."
+            )
+            python_spec = None
+            for interpreter in self.find_interpreters(python_spec, search_venv):
+                if filter_func is None or filter_func(interpreter):
+                    found = True
+                    yield interpreter
         if found or self.is_global:
             return
 
