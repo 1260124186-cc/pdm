@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import venv
 from collections.abc import Callable
 from pathlib import Path
@@ -22,6 +23,20 @@ from pdm.project.core import Project
 from tests import FIXTURES
 
 pytestmark = pytest.mark.usefixtures("local_finder")
+
+
+def _candidate(name: str, wheel: str) -> Candidate:
+    return Candidate(
+        parse_requirement(name),
+        link=Link(f"http://fixtures.test/artifacts/{wheel}"),
+    )
+
+
+def _move_cache_root(project: Project, dest: Path) -> None:
+    """Simulate moving the whole PDM cache directory to another disk."""
+    old_root = Path(project.config["cache_dir"])
+    shutil.move(str(old_root), str(dest))
+    project.global_config["cache_dir"] = dest.as_posix()
 
 
 @pytest.fixture()
@@ -317,3 +332,121 @@ def test_compress_file_list_for_rename():
     }
     abs_paths = {os.path.join(project_root, path) for path in paths}
     assert sorted(compress_for_rename(abs_paths)) == [os.path.join(project_root, "test-removal" + os.sep)]
+
+
+def test_repair_relinks_broken_cache_installation(project, pdm):
+    installer = InstallManager(project.environment, use_install_cache=True)
+    installer.install(_candidate("future-fstrings", "future_fstrings-1.2.0-py2.py3-none-any.whl"))
+    lib_path = Path(project.environment.get_paths()["purelib"])
+    module = lib_path / "future_fstrings.py"
+    assert module.is_symlink() and module.exists()
+    cache_name = "future_fstrings-1.2.0-py2.py3-none-any.whl.cache"
+
+    new_cache_root = project.root / "moved-caches"
+    _move_cache_root(project, new_cache_root)
+    assert module.is_symlink() and not module.exists()
+    # The broken distribution is invisible to the plain working set.
+    assert "future-fstrings" not in project.environment.get_working_set()
+
+    installer = InstallManager(project.environment, use_install_cache=True)
+    broken = installer.find_broken_cache_distributions()
+    assert len(broken) == 1
+    dist, old_cache = broken[0]
+    assert old_cache.name == cache_name
+
+    assert installer.repair_cache_distributions() == [("future-fstrings", "relinked")]
+
+    assert module.exists()
+    assert Path(os.readlink(module)).is_relative_to(new_cache_root)
+    new_package = project.package_cache.find_package(cache_name)
+    assert new_package is not None
+    dist_info = lib_path / "future_fstrings-1.2.0.dist-info"
+    assert (dist_info / "REFER_TO").read_text() == new_package.path.as_posix()
+    assert os.path.normcase(str(dist_info)) in new_package.referrers
+    # Imports work again and uninstall keeps functioning.
+    result = pdm(["run", "python", "-c", "import future_fstrings"], obj=project)
+    assert result.exit_code == 0
+    repaired = project.environment.get_working_set()["future-fstrings"]
+    installer.uninstall(repaired)
+    assert not module.exists()
+    assert os.path.normcase(str(dist_info)) not in new_package.referrers
+
+
+def test_repair_skips_healthy_cache_installation(project):
+    installer = InstallManager(project.environment, use_install_cache=True)
+    installer.install(_candidate("future-fstrings", "future_fstrings-1.2.0-py2.py3-none-any.whl"))
+    lib_path = Path(project.environment.get_paths()["purelib"])
+    module = lib_path / "future_fstrings.py"
+
+    assert installer.find_broken_cache_distributions() == []
+    assert installer.repair_cache_distributions() == []
+    target_before = os.readlink(module)
+    installer.repair_cache_distributions()
+    assert os.readlink(module) == target_before
+
+
+def test_repair_skips_non_cached_installation(project):
+    InstallManager(project.environment, use_install_cache=False).install(
+        _candidate("demo", "demo-0.0.1-py2.py3-none-any.whl")
+    )
+    lib_path = Path(project.environment.get_paths()["purelib"])
+    demo_file = lib_path / "demo.py"
+    assert demo_file.is_file() and not demo_file.is_symlink()
+    assert not (lib_path / "demo-0.0.1.dist-info" / "REFER_TO").exists()
+
+    installer = InstallManager(project.environment, use_install_cache=True)
+    assert installer.find_broken_cache_distributions() == []
+    # Even with the cache directory gone, regular (copied) installs are not touched.
+    _move_cache_root(project, project.root / "moved-caches")
+    assert installer.find_broken_cache_distributions() == []
+    assert demo_file.exists()
+
+
+def test_repair_skips_editable_installation(project, tmp_path_factory):
+    editable_path: Path = tmp_path_factory.mktemp("editable-project")
+    (editable_path / "setup.py").write_text(
+        """
+from setuptools import setup
+
+setup(name='editable-project',
+      version='0.1.0',
+      description='',
+      py_modules=['module'],
+)
+"""
+    )
+    (editable_path / "module.py").write_text("")
+    req = parse_requirement(f"{editable_path.as_uri()}#egg=editable-project", True)
+    InstallManager(project.environment, use_install_cache=True).install(Candidate(req))
+
+    installer = InstallManager(project.environment, use_install_cache=True)
+    assert installer.find_broken_cache_distributions() == []
+    _move_cache_root(project, project.root / "moved-caches")
+    assert installer.find_broken_cache_distributions() == []
+
+
+def test_repair_reinstalls_only_distribution_with_missing_cache(project):
+    installer = InstallManager(project.environment, use_install_cache=True)
+    installer.install(_candidate("future-fstrings", "future_fstrings-1.2.0-py2.py3-none-any.whl"))
+    installer.install(_candidate("jmespath", "jmespath-0.10.0-py2.py3-none-any.whl"))
+
+    new_cache_root = project.root / "moved-caches"
+    _move_cache_root(project, new_cache_root)
+    # The jmespath cache is lost for good, future-fstrings is still available.
+    jmespath_cache = project.package_cache.find_package("jmespath-0.10.0-py2.py3-none-any.whl.cache")
+    assert jmespath_cache is not None
+    shutil.rmtree(jmespath_cache.path)
+
+    installer = InstallManager(project.environment, use_install_cache=True)
+    assert dict(installer.repair_cache_distributions()) == {
+        "future-fstrings": "relinked",
+        "jmespath": "reinstalled",
+    }
+
+    working_set = project.environment.get_working_set()
+    assert "future-fstrings" in working_set and "jmespath" in working_set
+    lib_path = Path(project.environment.get_paths()["purelib"])
+    assert (lib_path / "jmespath").exists()
+    assert Path(os.readlink(lib_path / "future_fstrings.py")).is_relative_to(new_cache_root)
+    # A fresh cache entry is created for the reinstalled package only.
+    assert project.package_cache.find_package("jmespath-0.10.0-py2.py3-none-any.whl.cache") is not None

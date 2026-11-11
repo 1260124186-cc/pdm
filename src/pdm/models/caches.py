@@ -306,6 +306,20 @@ class PackageCache:
                 pass
             yield p
 
+    def find_package(self, name: str) -> CachedPackage | None:
+        """Find a cached package by its directory name, e.g.
+        ``foo-1.0-py3-none-any.whl.cache``. The name only depends on the
+        wheel filename so it stays stable when the cache root is moved.
+        """
+        for path in self.root.rglob("*.whl.cache"):
+            if path.name != name:
+                continue
+            package = CachedPackage(path)
+            with package.lock():  # ensure the package is not being created
+                pass
+            return package
+        return None
+
     def cleanup(self) -> int:
         """Remove unused cached packages"""
         count = 0

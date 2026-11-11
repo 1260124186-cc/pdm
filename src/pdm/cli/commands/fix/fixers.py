@@ -2,11 +2,15 @@ import abc
 import re
 import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pdm.project import Config, Project
 from pdm.project.lockfile import FLAG_CROSS_PLATFORM
 from pdm.termui import Verbosity
 from pdm.utils import open_for_write_no_symlink, parse_version
+
+if TYPE_CHECKING:
+    from pdm.installers.manager import InstallManager
 
 
 class BaseFixer(abc.ABC):
@@ -163,3 +167,34 @@ class LockStrategyFixer(BaseFixer):
         lockfile["metadata"]["strategy"] = sorted(strategies)
         self.project.lockfile.write(False)
         self.log("Lock strategy [success]`cross_platform` has been removed.", verbosity=Verbosity.DETAIL)
+
+
+class CachedPackageFixer(BaseFixer):
+    """Re-link installations that point to a moved or missing package cache."""
+
+    identifier = "cached-packages"
+    breaking = True
+
+    def _manager(self) -> InstallManager:
+        from pdm.installers.manager import InstallManager
+
+        return self.project.core.install_manager_class(
+            self.project.environment,
+            use_install_cache=bool(self.project.config["install.cache"]),
+        )
+
+    def get_message(self) -> str:
+        return (
+            "Some installed packages are linked to a PDM package cache location that no longer "
+            "exists and need to be re-linked to the current cache or reinstalled."
+        )
+
+    def check(self) -> bool:
+        return bool(self._manager().find_broken_cache_distributions())
+
+    def fix(self) -> None:
+        for name, action in self._manager().repair_cache_distributions():
+            self.log(
+                f"{action.capitalize()} [success]{name}[/] after the package cache relocation.",
+                verbosity=Verbosity.DETAIL,
+            )

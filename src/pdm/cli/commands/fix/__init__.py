@@ -5,6 +5,7 @@ import argparse
 from pdm.cli.commands.base import BaseCommand
 from pdm.cli.commands.fix.fixers import (
     BaseFixer,
+    CachedPackageFixer,
     LockStrategyFixer,
     PackageTypeFixer,
     ProjectConfigFixer,
@@ -60,6 +61,7 @@ class Command(BaseCommand):
             ProjectPluginFixer(project),
             PackageTypeFixer(project),
             LockStrategyFixer(project),
+            CachedPackageFixer(project),
         ]
 
     def handle(self, project: Project, options: argparse.Namespace) -> None:
