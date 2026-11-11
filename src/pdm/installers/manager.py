@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from importlib.metadata import Distribution
 from typing import TYPE_CHECKING
 
@@ -17,11 +18,17 @@ class InstallManager:
     """The manager that performs the installation and uninstallation actions."""
 
     def __init__(
-        self, environment: BaseEnvironment, *, use_install_cache: bool = False, rename_pth: bool = False
+        self,
+        environment: BaseEnvironment,
+        *,
+        use_install_cache: bool = False,
+        rename_pth: bool = False,
+        stash_listener: Callable[[str, str], None] | None = None,
     ) -> None:
         self.environment = environment
         self.use_install_cache = use_install_cache
         self.rename_pth = rename_pth
+        self.stash_listener = stash_listener
 
     def install(self, candidate: Candidate) -> Distribution:
         """Install a candidate into the environment, return the distribution"""
@@ -38,7 +45,10 @@ class InstallManager:
 
     def get_paths_to_remove(self, dist: Distribution) -> BaseRemovePaths:
         """Get the path collection to be removed from the disk"""
-        return StashedRemovePaths.from_dist(dist, environment=self.environment)
+        kwargs: dict[str, object] = {"environment": self.environment}
+        if self.stash_listener is not None:
+            kwargs["on_stash"] = self.stash_listener
+        return StashedRemovePaths.from_dist(dist, **kwargs)
 
     def uninstall(self, dist: Distribution) -> None:
         """Perform the uninstallation for a given distribution"""

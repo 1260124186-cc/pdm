@@ -4,7 +4,7 @@ import abc
 import glob
 import os
 import shutil
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, NewType, cast
@@ -154,10 +154,15 @@ class BaseRemovePaths(abc.ABC):
         """Roll back the removal operations"""
 
     @classmethod
-    def from_dist(cls, dist: Distribution, environment: BaseEnvironment) -> Self:
+    def from_dist(
+        cls,
+        dist: Distribution,
+        environment: BaseEnvironment,
+        on_stash: Callable[[str, str], None] | None = None,
+    ) -> Self:
         """Create an instance from the distribution"""
         scheme = environment.get_paths()
-        instance = cls(dist, environment)
+        instance = cls(dist, environment, on_stash=on_stash)
         meta_location = os.path.normcase(dist._path.absolute())  # type: ignore[attr-defined]
         dist_location = os.path.dirname(meta_location)
         if is_egg_link(dist):  # pragma: no cover
@@ -230,12 +235,20 @@ class StashedRemovePaths(BaseRemovePaths):
 
     PTH_REGISTRY = "easy-install.pth"
 
-    def __init__(self, dist: Distribution, environment: BaseEnvironment) -> None:
+    def __init__(
+        self,
+        dist: Distribution,
+        environment: BaseEnvironment,
+        on_stash: Callable[[str, str], None] | None = None,
+    ) -> None:
         super().__init__(dist, environment)
         self._pth_file = os.path.join(self.environment.get_paths()["purelib"], self.PTH_REGISTRY)
         self._saved_pth: bytes | None = None
         self._stashed: list[tuple[str, str]] = []
         self._tempdirs: dict[str, TemporaryDirectory] = {}
+        # Write-ahead callback invoked with (tempdir, root) before files are
+        # moved into a new stash directory, so recovery can always roll back.
+        self.on_stash = on_stash
 
     def remove(self) -> None:
         self._remove_pth()
@@ -272,7 +285,11 @@ class StashedRemovePaths(BaseRemovePaths):
                 termui.logger.debug("File path %s is not under packages root %s, skip", old_path, prefix)
                 continue
             if root not in self._tempdirs:
-                self._tempdirs[root] = TemporaryDirectory("-uninstall", "pdm-")
+                tempdir = TemporaryDirectory("-uninstall", "pdm-")
+                self._tempdirs[root] = tempdir
+                if self.on_stash is not None:
+                    # Log the stash before any file is moved into it.
+                    self.on_stash(tempdir.name, root)
             new_root = self._tempdirs[root].name
             relpath = os.path.relpath(old_path, root)
             new_path = os.path.join(new_root, relpath)

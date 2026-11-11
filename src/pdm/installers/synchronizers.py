@@ -151,12 +151,33 @@ class Synchronizer(BaseSynchronizer):
                     path.rename(target_path)
 
     def synchronize(self) -> None:
+        recovery = getattr(self, "recovery", None)
+        if recovery is not None and not self.dry_run:
+            # Repair leftovers of a hard-killed run before planning anything.
+            recovery.recover_environment()
+            # The scan may have repaired or removed broken distributions.
+            self.working_set = self.environment.get_working_set()
         to_add, to_update, to_remove = self.compare_with_working_set()
         to_do = {"remove": to_remove, "update": to_update, "add": to_add}
 
         if self.dry_run:
             self._show_summary(to_do)
             return
+
+        operations = self._build_operations(to_add, to_update, to_remove)
+        self_operation = self._self_operation()
+        if self_operation is not None:
+            operations.append(self_operation)
+        done = self._prepare_recovery(operations)
+        if done:
+            # Only keep the operations that still have to run, so both the
+            # headline and the executed jobs describe the same work.
+            for kind, packages in to_do.items():
+                packages[:] = [key for key in packages if f"{kind}:{key}" not in done]
+            self.ui.echo(
+                f"[success]{len(done)}[/] package operation(s) were already completed in a previous "
+                "run and are skipped."
+            )
 
         self._show_headline(to_do)
         handlers = {
@@ -176,6 +197,12 @@ class Synchronizer(BaseSynchronizer):
                     sequential_jobs.append((kind, key))
                 else:
                     parallel_jobs.append((kind, key))
+
+        def run_job(kind: str, key: str, progress: Progress):
+            result = handlers[kind](key, progress)
+            if recovery is not None:
+                recovery.mark_done(kind, key)
+            return result
 
         state = SimpleNamespace(errors=[], parallel_failed=[], sequential_failed=[], jobs=[], mark_failed=False)
 
@@ -203,7 +230,7 @@ class Synchronizer(BaseSynchronizer):
                 status.update_spinner(completed=0, total=len(sequential_jobs) + len(parallel_jobs))
                 for kind, key in sequential_jobs:
                     try:
-                        handlers[kind](key, status.progress)
+                        run_job(kind, key, status.progress)
                     except Exception:
                         termui.logger.exception("Error occurs: ")
                         state.sequential_failed.append((kind, key))
@@ -220,7 +247,7 @@ class Synchronizer(BaseSynchronizer):
                     executor = ThreadPoolExecutor()
                     try:
                         for kind, key in parallel_jobs:
-                            future = executor.submit(handlers[kind], key, status.progress)
+                            future = executor.submit(run_job, kind, key, status.progress)
                             future.add_done_callback(functools.partial(update_progress, kind=kind, key=key))
                             state.jobs.append(future)
                         _wait_for_jobs(state.jobs)
@@ -258,17 +285,28 @@ class Synchronizer(BaseSynchronizer):
                     raise InstallationError("Some package operations failed.")
 
                 if self.install_self:
+                    assert self_operation is not None
                     self_key = self.self_key
                     assert self_key
                     self.candidates[self_key] = self.self_candidate
                     word = "a" if self.no_editable else "an editable"
                     status.update_spinner(description=f"Installing the project as {word} package...")
-                    if self_key in self.working_set:
-                        self.update_candidate(self_key, status.progress)
-                    else:
-                        self.install_candidate(self_key, status.progress)
+                    if self_operation.op_id not in done:
+                        if self_key in self.working_set:
+                            self.update_candidate(self_key, status.progress)
+                        else:
+                            self.install_candidate(self_key, status.progress)
+                        if recovery is not None:
+                            recovery.mark_done(self_operation.kind, self_key)
 
                 status.update_spinner(description=f"{termui.Emoji.POPPER} All complete!")
             finally:
                 # Now we remove the .pdmtmp suffix from the installed packages
                 self._fix_pth_files()
+
+        if recovery is not None:
+            # The journal is only discarded after the on-disk state proves the
+            # result. Any failure above keeps it for the next run to resume.
+            fresh_working_set = self.environment.get_working_set()
+            recovery.verify_final_state(self.candidates, fresh_working_set)
+            recovery.discard()

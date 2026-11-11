@@ -221,6 +221,7 @@ class Distribution:
         version: str,
         editable: bool = False,
         metadata: Metadata | None = None,
+        files: dict[str, str] | None = None,
     ):
         self.version = version
         self.link_file = "editable" if editable else None
@@ -229,6 +230,11 @@ class Distribution:
         if metadata:
             self._metadata.update(metadata)
         self.name = key
+        # Distributions created through the mocked installer are treated as
+        # PDM-managed, mirroring the INSTALLER marker written by the real one.
+        self._files = {"INSTALLER": "pdm\n"}
+        if files:
+            self._files.update(files)
 
     @property
     def metadata(self) -> Metadata:
@@ -241,8 +247,8 @@ class Distribution:
     def requires(self) -> list[str]:
         return self.dependencies
 
-    def read_text(self, path: Path | str) -> None:
-        return None
+    def read_text(self, path: Path | str) -> str | None:
+        return self._files.get(path)
 
 
 class MockWorkingSet(collections.abc.MutableMapping):
