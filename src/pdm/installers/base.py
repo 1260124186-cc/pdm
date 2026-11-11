@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import posixpath
 from collections.abc import Collection, Iterable
 from functools import cached_property
 from importlib.metadata import Distribution
 from itertools import chain
+from pathlib import Path
+from typing import Any
 
 from pdm import termui
 from pdm.environments import BaseEnvironment
@@ -13,8 +16,13 @@ from pdm.exceptions import BuildError
 from pdm.installers.manager import InstallManager
 from pdm.models.candidates import Candidate
 from pdm.models.repositories import Package
-from pdm.models.requirements import FileRequirement, Requirement, parse_requirement, strip_extras
-from pdm.utils import is_editable, normalize_name
+from pdm.models.requirements import FileRequirement, Requirement, VcsRequirement, parse_requirement, strip_extras
+from pdm.utils import is_editable, normalize_name, url_to_path, url_without_fragments
+
+
+def _filter_none(data: dict[str, Any]) -> dict[str, Any]:
+    """Return a new dict without None values"""
+    return {k: v for k, v in data.items() if v is not None}
 
 
 def editables_candidate(environment: BaseEnvironment) -> Candidate | None:
@@ -149,11 +157,99 @@ class BaseSynchronizer:
             return normalize_name(name)
         return name
 
+    @staticmethod
+    def _normalize_source_url(url: str | None) -> str | None:
+        """Canonicalize a direct URL so that the same local source compares equal
+        regardless of how the file:// URL was spelled in the records."""
+        if not url:
+            return url
+        if url.startswith("file:"):
+            return Path(posixpath.normpath(url_to_path(url))).as_uri()
+        return url_without_fragments(url)
+
+    def _expected_editable_direct_url(self, can: Candidate) -> dict[str, Any]:
+        """Build the direct_url.json provenance expected for the locked editable
+        candidate, without fetching or building anything."""
+        req = can.req
+        subdirectory = getattr(req, "subdirectory", None)
+        if isinstance(req, VcsRequirement):
+            return _filter_none(
+                {
+                    "url": url_without_fragments(req.repo),
+                    "vcs_info": _filter_none(
+                        {
+                            "vcs": req.vcs,
+                            "requested_revision": req.ref,
+                            "commit_id": req.revision,
+                        }
+                    ),
+                    "dir_info": {"editable": True},
+                    "subdirectory": subdirectory,
+                }
+            )
+        assert can.link is not None
+        return _filter_none(
+            {
+                "url": can.link.url_without_fragment,
+                "dir_info": {"editable": True},
+                "subdirectory": subdirectory,
+            }
+        )
+
+    def _editable_source_mismatched(self, dist: Distribution, can: Candidate) -> bool:
+        """Compare the locked editable source with the installed direct_url.json.
+
+        Return True only when the provenance cannot be proven identical, so the
+        package has to be rebuilt and reinstalled. A missing or unreadable record
+        fails closed by triggering a reinstall. A locked local source that no
+        longer exists raises instead of silently keeping a broken environment.
+        """
+        req = can.req
+        if isinstance(req, FileRequirement) and req.absolute_path is not None:
+            # Raise a clear error before touching the environment when the locked
+            # source cannot be used (e.g. the local directory was moved away).
+            req.check_installable()
+        content = dist.read_text("direct_url.json")
+        if not content:
+            termui.logger.info(
+                "Reinstalling editable %s: no direct_url.json record is found in the environment.", can.name
+            )
+            return True
+        try:
+            recorded = json.loads(content)
+        except json.JSONDecodeError:
+            termui.logger.warning("The direct_url.json record of %s is broken, reinstalling it.", can.name)
+            return True
+        expected = self._expected_editable_direct_url(can)
+        if recorded.get("dir_info", {}).get("editable") is not True:
+            return True
+        if self._normalize_source_url(recorded.get("url")) != self._normalize_source_url(expected["url"]):
+            return True
+        if recorded.get("subdirectory") != expected.get("subdirectory"):
+            return True
+        if isinstance(req, VcsRequirement):
+            recorded_vcs = recorded.get("vcs_info")
+            if not isinstance(recorded_vcs, dict):
+                # Records written by older PDM versions don't carry the VCS
+                # revision, reinstall to gain the provenance and the new ref.
+                return True
+            if recorded_vcs.get("vcs") != req.vcs:
+                return True
+            if recorded_vcs.get("requested_revision") != req.ref:
+                return True
+            if req.revision and recorded_vcs.get("commit_id") != req.revision:
+                return True
+        return False
+
     def _should_update(self, dist: Distribution, can: Candidate) -> bool:
         """Check if the candidate should be updated"""
         backend = self.environment.project.backend
-        if self.reinstall or can.req.editable:  # Always update if incoming is editable
+        if self.reinstall:
             return True
+        if can.req.editable:
+            # Reinstall editable packages only when the locked source (path or
+            # VCS revision) diverges from the installed direct_url.json record.
+            return self._editable_source_mismatched(dist, can)
         if is_editable(dist):  # only update editable if no_editable is True
             return bool(self.no_editable)
         if not can.req.is_named:

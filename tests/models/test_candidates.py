@@ -52,6 +52,25 @@ def test_parse_vcs_metadata(project, is_editable):
         assert lockfile["revision"] == "1234567890abcdef"
 
 
+@pytest.mark.usefixtures("vcs", "local_finder")
+def test_editable_vcs_direct_url_carries_revision_provenance(project):
+    requirement_line = "git+https://github.com/test-root/demo.git@master#egg=demo"
+    req = parse_requirement(requirement_line, True)
+    candidate = Candidate(req)
+    prepared = candidate.prepare(project.environment)
+    prepared.build()
+
+    assert prepared.direct_url() == {
+        "url": "https://github.com/test-root/demo.git",
+        "vcs_info": {
+            "vcs": "git",
+            "requested_revision": "master",
+            "commit_id": "1234567890abcdef",
+        },
+        "dir_info": {"editable": True},
+    }
+
+
 @pytest.mark.usefixtures("local_finder")
 @pytest.mark.parametrize(
     "requirement_line",

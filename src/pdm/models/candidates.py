@@ -382,10 +382,20 @@ class PreparedCandidate:
         req = self.req
         if isinstance(req, VcsRequirement):
             if req.editable:
+                # Keep the PEP 610 vcs_info (repo + requested revision + resolved
+                # commit) alongside the editable flag so that later synchronizations
+                # can prove whether the installed checkout still matches the lock.
                 assert self._source_dir
                 return _filter_none(
                     {
-                        "url": self._source_dir.as_uri(),
+                        "url": url_without_fragments(req.repo),
+                        "vcs_info": _filter_none(
+                            {
+                                "vcs": req.vcs,
+                                "requested_revision": req.ref,
+                                "commit_id": self.revision,
+                            }
+                        ),
                         "dir_info": {"editable": True},
                         "subdirectory": req.subdirectory,
                     }

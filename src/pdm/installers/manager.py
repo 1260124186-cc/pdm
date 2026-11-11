@@ -54,15 +54,32 @@ class InstallManager:
             raise UninstallError(e) from e
 
     def overwrite(self, dist: Distribution, candidate: Candidate) -> None:
-        """An in-place update to overwrite the distribution with a new candidate"""
+        """An in-place update to overwrite the distribution with a new candidate.
+
+        The old distribution (including its .pth entries and console scripts) is
+        stashed away before the new one is installed, so an interruption can
+        never leave two distributions or stale entry points in the environment.
+        Any failure restores the stashed files and keeps the old distribution.
+        """
         paths_to_remove = self.get_paths_to_remove(dist)
         termui.logger.info("Overwriting distribution %s", dist.metadata.get("Name"))
-        installed = self.install(candidate)
-        installed_paths = self.get_paths_to_remove(installed)
-        # Remove the paths that are in the new distribution
-        paths_to_remove.difference_update(installed_paths)
         try:
             paths_to_remove.remove()
+            installed = self.install(candidate)
+        except OSError as e:
+            termui.logger.warning("Error occurred during overwriting, roll back the changes now.")
+            paths_to_remove.rollback()
+            raise UninstallError(e) from e
+        except BaseException:
+            # e.g. KeyboardInterrupt: restore the old distribution instead of
+            # leaving the environment with neither record available.
+            termui.logger.warning("Overwriting was interrupted, roll back the changes now.")
+            paths_to_remove.rollback()
+            raise
+        installed_paths = self.get_paths_to_remove(installed)
+        # Drop the stashed paths that are provided by the new distribution
+        paths_to_remove.difference_update(installed_paths)
+        try:
             paths_to_remove.commit()
         except OSError as e:
             termui.logger.warning("Error occurred during overwriting, roll back the changes now.")

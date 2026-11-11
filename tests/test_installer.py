@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
+import shutil
 import venv
 from collections.abc import Callable
 from pathlib import Path
@@ -14,7 +16,9 @@ from pdm.core import Core
 from pdm.environments.base import BaseEnvironment
 from pdm.environments.local import PythonLocalEnvironment
 from pdm.environments.python import PythonEnvironment
+from pdm.exceptions import RequirementError
 from pdm.installers import InstallManager
+from pdm.installers.base import BaseSynchronizer
 from pdm.models.cached_package import CachedPackage
 from pdm.models.candidates import Candidate
 from pdm.models.requirements import parse_requirement
@@ -256,6 +260,98 @@ setup(name='editable-project',
     for pth in lib_path.glob("*editable_project*.pth"):
         assert pth.is_file()
         assert not pth.is_symlink()
+
+
+def _make_local_editable(path: Path, name: str, marker: str) -> Path:
+    path.mkdir(parents=True)
+    path.joinpath("setup.py").write_text(
+        f"from setuptools import setup\nsetup(name={name!r}, version='0.1.0', py_modules=['module'])\n"
+    )
+    path.joinpath("module.py").write_text(f"VALUE = {marker!r}\n")
+    return path
+
+
+def _editable_candidate(path: Path, name: str) -> Candidate:
+    return Candidate(parse_requirement(f"{path.as_uri()}#egg={name}", True))
+
+
+def test_editable_sync_reconciles_moved_source(project, tmp_path):
+    env = project.environment
+    manager = InstallManager(env)
+    foo_source = _make_local_editable(tmp_path / "packages" / "foo", "foo", "old")
+    bar_source = _make_local_editable(tmp_path / "packages" / "bar", "bar", "bar")
+    foo = _editable_candidate(foo_source, "foo")
+    bar = _editable_candidate(bar_source, "bar")
+    manager.install(foo)
+    manager.install(bar)
+
+    def make_synchronizer(candidates):
+        return BaseSynchronizer(env, candidates=candidates)
+
+    # Both editable records match the locked sources: nothing to do.
+    assert make_synchronizer({"foo": foo, "bar": bar}).compare_with_working_set() == ([], [], [])
+
+    # Move only foo's source directory; bar's source stays where it was.
+    new_foo_source = tmp_path / "packages" / "foo-moved"
+    shutil.move(foo_source, new_foo_source)
+    new_foo = _editable_candidate(new_foo_source, "foo")
+    to_add, to_update, to_remove = make_synchronizer({"foo": new_foo, "bar": bar}).compare_with_working_set()
+    assert to_update == ["foo"]
+    assert not to_add and not to_remove
+
+    # Apply the sync: foo is reinstalled from the new source, bar is untouched.
+    bar_dist_info = env.get_working_set()["bar"]._path
+    make_synchronizer({"foo": new_foo, "bar": bar}).synchronize()
+    assert env.get_working_set()["bar"]._path == bar_dist_info
+    foo_dist = env.get_working_set()["foo"]
+    assert json.loads(foo_dist.read_text("direct_url.json"))["url"] == new_foo_source.as_uri()
+
+    # A follow-up sync converges to a no-op.
+    assert make_synchronizer({"foo": new_foo, "bar": bar}).compare_with_working_set() == ([], [], [])
+
+    # A locked source that disappeared must fail loudly instead of claiming
+    # the environment is up to date.
+    shutil.rmtree(new_foo_source)
+    with pytest.raises(RequirementError, match="does not exist"):
+        make_synchronizer({"foo": new_foo, "bar": bar}).compare_with_working_set()
+
+
+def test_editable_overwrite_rolls_back_after_interruption(project, tmp_path, mocker):
+    env = project.environment
+    manager = InstallManager(env)
+    source = _make_local_editable(tmp_path / "pkg", "pkg", "old")
+    candidate = _editable_candidate(source, "pkg")
+    manager.install(candidate)
+    dist_before = env.get_working_set()["pkg"]
+    record_before = dist_before.read_text("direct_url.json")
+    purelib = Path(env.get_paths()["purelib"])
+
+    new_source = _make_local_editable(tmp_path / "pkg-new", "pkg", "new")
+    new_candidate = _editable_candidate(new_source, "pkg")
+
+    real_install = InstallManager.install
+    state = {"failed": False}
+
+    def interrupt_once(self, candidate):
+        if not state["failed"]:
+            state["failed"] = True
+            raise KeyboardInterrupt
+        return real_install(self, candidate)
+
+    mocker.patch.object(InstallManager, "install", interrupt_once)
+    with pytest.raises(KeyboardInterrupt):
+        manager.overwrite(dist_before, new_candidate)
+
+    # The old distribution is restored and no duplicate dist-info is left.
+    dist_after = env.get_working_set()["pkg"]
+    assert dist_after.read_text("direct_url.json") == record_before
+    assert len(list(purelib.glob("pkg-*.dist-info"))) == 1
+
+    # Re-running the overwrite converges to the new source with a single record.
+    manager.overwrite(dist_after, new_candidate)
+    dist_final = env.get_working_set()["pkg"]
+    assert json.loads(dist_final.read_text("direct_url.json"))["url"] == new_source.as_uri()
+    assert len(list(purelib.glob("pkg-*.dist-info"))) == 1
 
 
 @pytest.mark.parametrize("use_install_cache", [False, True])

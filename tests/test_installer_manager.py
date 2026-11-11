@@ -98,11 +98,21 @@ def test_overwrite_preserves_new_distribution_paths(mocker):
     old_paths = mocker.Mock()
     new_paths = mocker.Mock()
     manager = InstallManager(mocker.sentinel.environment)
-    mocker.patch.object(manager, "install", return_value=installed)
+    events = []
+    old_paths.remove.side_effect = lambda: events.append("remove")
+    install = mocker.patch.object(
+        manager,
+        "install",
+        side_effect=lambda can: events.append("install") or installed,
+    )
     mocker.patch.object(manager, "get_paths_to_remove", side_effect=[old_paths, new_paths])
 
     manager.overwrite(dist, candidate)
 
+    # The old distribution must be stashed before the new one is installed so
+    # the two can never coexist in the environment.
+    assert events == ["remove", "install"]
+    install.assert_called_once_with(candidate)
     old_paths.difference_update.assert_called_once_with(new_paths)
     old_paths.remove.assert_called_once_with()
     old_paths.commit.assert_called_once_with()
@@ -113,11 +123,39 @@ def test_overwrite_rolls_back_after_remove_error(mocker):
     old_paths = mocker.Mock()
     old_paths.remove.side_effect = OSError("cannot remove")
     manager = InstallManager(mocker.sentinel.environment)
-    mocker.patch.object(manager, "install")
+    install = mocker.patch.object(manager, "install")
     mocker.patch.object(manager, "get_paths_to_remove", side_effect=[old_paths, mocker.Mock()])
 
     with pytest.raises(UninstallError):
         manager.overwrite(mocker.Mock(), mocker.sentinel.candidate)
 
+    install.assert_not_called()
     old_paths.commit.assert_not_called()
     old_paths.rollback.assert_called_once_with()
+
+
+def test_overwrite_rolls_back_when_install_is_interrupted(mocker):
+    old_paths = mocker.Mock()
+    manager = InstallManager(mocker.sentinel.environment)
+    mocker.patch.object(manager, "install", side_effect=KeyboardInterrupt)
+    mocker.patch.object(manager, "get_paths_to_remove", return_value=old_paths)
+
+    with pytest.raises(KeyboardInterrupt):
+        manager.overwrite(mocker.Mock(), mocker.sentinel.candidate)
+
+    old_paths.remove.assert_called_once_with()
+    old_paths.rollback.assert_called_once_with()
+    old_paths.commit.assert_not_called()
+
+
+def test_overwrite_wraps_install_oserror_and_rolls_back(mocker):
+    old_paths = mocker.Mock()
+    manager = InstallManager(mocker.sentinel.environment)
+    mocker.patch.object(manager, "install", side_effect=OSError("no space left"))
+    mocker.patch.object(manager, "get_paths_to_remove", return_value=old_paths)
+
+    with pytest.raises(UninstallError, match="no space left"):
+        manager.overwrite(mocker.Mock(), mocker.sentinel.candidate)
+
+    old_paths.rollback.assert_called_once_with()
+    old_paths.commit.assert_not_called()
